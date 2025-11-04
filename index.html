@@ -1,0 +1,410 @@
+from caas_jupyter_tools import display_dataframe_to_user
+html = r"""<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>VideoMaster — Safari mode</title>
+<style>
+  :root{
+    --bg:#0f1724; --fg:#e6eef6; --panel:#0b1220; --accent:#06b6d4; --danger:#ff3b30;
+  }
+  html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial}
+  .wrap{max-width:1200px;margin:12px auto;padding:10px;display:flex;flex-wrap:wrap;gap:12px;box-sizing:border-box}
+  h1{width:100%;text-align:center;margin:8px 0 6px 0}
+  .panel{background:var(--panel);padding:10px;border-radius:10px;box-shadow:0 6px 18px rgba(0,0,0,0.28);width:320px;box-sizing:border-box}
+  .panel.full{width:100%;max-width:760px}
+  input[type=text]{width:100%;padding:8px;border-radius:8px;border:none;background:rgba(255,255,255,0.03);color:var(--fg);box-sizing:border-box}
+  ul{list-style:none;margin:8px 0;padding:0;max-height:320px;overflow:auto}
+  li{display:flex;align-items:center;gap:8px;padding:8px;border-radius:8px;margin:6px 0;background:rgba(255,255,255,0.02);user-select:none}
+  .name{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:grab}
+  button{background:var(--accent);border:none;color:#fff;padding:6px 10px;border-radius:8px;cursor:pointer}
+  .small{font-size:13px;padding:4px 8px}
+  .danger{background:var(--danger)}
+  .controls{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin-top:8px}
+  audio{width:100%;max-width:760px;border-radius:10px;background:#000;display:block;margin:8px auto}
+  .topbar{display:flex;gap:8px;align-items:center;justify-content:center;margin-bottom:8px;flex-wrap:wrap}
+  .hint{font-size:13px;color:rgba(255,255,255,0.6);margin-top:6px}
+  .muted{opacity:0.45}
+  @media(max-width:900px){.panel{width:100%}.panel.full{order:3}}
+  /* make it feel app-like in Safari */
+  body::-webkit-scrollbar{height:6px;width:6px}
+  body{-webkit-user-select:none;-webkit-tap-highlight-color:transparent}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"></script>
+</head>
+<body>
+  <h1>🎧 VideoMaster (Safari mode)</h1>
+
+  <div class="topbar">
+    <button id="themeToggle" class="small">🌗 テーマ切替</button>
+    <div style="font-size:13px;color:rgba(255,255,255,0.6)">（Safariで開くとバックグラウンド再生されやすい）</div>
+  </div>
+
+  <div class="wrap">
+    <div class="panel">
+      <h3>プレイリスト</h3>
+      <input id="playlistSearch" type="text" placeholder="🔍 プレイリスト検索">
+      <ul id="playlistList"></ul>
+      <div style="margin-top:8px;display:flex;gap:8px">
+        <button id="addPlaylist">＋ 新規</button>
+        <button id="exportBtn" class="small">エクスポート</button>
+      </div>
+      <div class="hint">プレイリストはこのブラウザに保存されます。</div>
+    </div>
+
+    <div class="panel">
+      <h3>ファイル（選択したプレイリストに追加）</h3>
+      <input id="fileSearch" type="text" placeholder="🔍 曲を検索">
+      <ul id="fileList"></ul>
+      <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+        <label for="fileInput" style="background:rgba(255,255,255,0.03);padding:6px 10px;border-radius:8px;cursor:pointer">＋ ファイルを追加</label>
+        <input id="fileInput" type="file" accept="audio/*" multiple style="display:none">
+      </div>
+      <div class="hint">ドラッグで並べ替え可能。長いファイルは読み込みに時間がかかります。</div>
+    </div>
+
+    <div class="panel full">
+      <audio id="player" controls playsinline webkit-playsinline></audio>
+      <div class="controls">
+        <button id="prevBtn">⏮ 前</button>
+        <button id="playBtn">▶ 再生</button>
+        <button id="pauseBtn">⏸ 停止</button>
+        <button id="nextBtn">⏭ 次</button>
+        <button id="loopBtn">🔁 ループ：オン</button>
+        <button id="fullscreenBtn">⛶ 全画面</button>
+      </div>
+      <div class="hint">Safariでこのページを開いて使ってください。</div>
+    </div>
+  </div>
+
+<script>
+/*
+ Safari-optimized VideoMaster
+ - Playlists (IndexedDB)
+ - No PWA manifest/service-worker
+ - Keep-alive via AudioContext, with safer handling:
+   - Fix pause-loop bug by stopping keep-alive on pause
+   - Attempt to resume audio at track boundary to avoid 'stopped' state
+ - Designed to be opened in Safari (not installed to home screen)
+*/
+
+let playlists = [];
+let currentPlaylist = null;
+let currentIndex = 0;
+let loopMode = true;
+let db = null;
+let audioCtx = null;
+let mediaSource = null;
+let keepAliveSource = null;
+let keepAliveGain = null;
+let resumeOnReturn = false;
+
+const player = document.getElementById('player');
+const fileInput = document.getElementById('fileInput');
+const fileList = document.getElementById('fileList');
+
+const openReq = indexedDB.open('VideoMaster_Safari_v1', 1);
+openReq.onupgradeneeded = e => {
+  db = e.target.result;
+  if(!db.objectStoreNames.contains('playlists')) db.createObjectStore('playlists', {keyPath:'name'});
+};
+openReq.onsuccess = e => {
+  db = e.target.result;
+  loadPlaylists();
+  const saved = localStorage.getItem('vm-theme');
+  if(saved) document.documentElement.dataset.theme = saved;
+};
+openReq.onerror = e => console.error('IndexedDB error', e);
+
+function savePlaylists(){
+  if(!db) return;
+  const tx = db.transaction('playlists','readwrite');
+  const store = tx.objectStore('playlists');
+  // Replace store contents
+  const clearReq = store.clear();
+  clearReq.onsuccess = () => {
+    for(const p of playlists) store.put(p);
+  };
+}
+
+function loadPlaylists(){
+  if(!db) return;
+  const tx = db.transaction('playlists','readonly');
+  const store = tx.objectStore('playlists');
+  const getAll = store.getAll();
+  getAll.onsuccess = () => {
+    playlists = getAll.result || [];
+    renderPlaylists();
+    if(playlists.length>0 && !currentPlaylist) selectPlaylist(playlists[0].name);
+  };
+}
+
+// rendering
+function renderPlaylists(){
+  const q = document.getElementById('playlistSearch').value.toLowerCase();
+  const ul = document.getElementById('playlistList');
+  ul.innerHTML = '';
+  playlists.filter(p => p.name.toLowerCase().includes(q)).forEach(p => {
+    const li = document.createElement('li');
+    const span = document.createElement('span'); span.className='name'; span.textContent = p.name; span.onclick = ()=>selectPlaylist(p.name);
+    const ren = document.createElement('button'); ren.textContent='✏️'; ren.className='small';
+    ren.onclick = e => { e.stopPropagation(); const nn = prompt('新しいプレイリスト名', p.name); if(nn){ p.name = nn; savePlaylists(); renderPlaylists(); } };
+    const del = document.createElement('button'); del.textContent='×'; del.className='danger';
+    del.onclick = e => { e.stopPropagation(); if(confirm(`「${p.name}」を削除しますか？`)){ playlists = playlists.filter(x=>x.name!==p.name); savePlaylists(); renderPlaylists(); if(currentPlaylist===p.name){ currentPlaylist=null; renderFiles(); } } };
+    li.append(span, ren, del);
+    ul.appendChild(li);
+  });
+}
+
+function renderFiles(){
+  const q = document.getElementById('fileSearch').value.toLowerCase();
+  const ul = document.getElementById('fileList');
+  ul.innerHTML = '';
+  const files = playlists.find(p=>p.name===currentPlaylist)?.files || [];
+  files.filter(f => f.name.toLowerCase().includes(q)).forEach((f,i) => {
+    const li = document.createElement('li');
+    const span = document.createElement('span'); span.className='name'; span.textContent = f.name; span.onclick = ()=>playFileIndex(i);
+    const ren = document.createElement('button'); ren.textContent='✏️'; ren.className='small';
+    ren.onclick = e => { e.stopPropagation(); const nn = prompt('新しい曲名', f.name); if(nn){ f.name = nn; const pl = playlists.find(p=>p.name===currentPlaylist); if(pl) pl.files = files; savePlaylists(); renderFiles(); } };
+    const del = document.createElement('button'); del.textContent='×'; del.className='danger';
+    del.onclick = e => { e.stopPropagation(); if(confirm(`${f.name} を削除しますか？`)){ files.splice(i,1); const pl = playlists.find(p=>p.name===currentPlaylist); if(pl) pl.files = files; savePlaylists(); renderFiles(); } };
+    li.append(span, ren, del);
+    ul.appendChild(li);
+  });
+
+  if(window.fileSortable) window.fileSortable.destroy();
+  window.fileSortable = Sortable.create(ul, {
+    animation: 150,
+    handle: '.name',
+    onEnd: function(evt){
+      const oldIndex = evt.oldIndex, newIndex = evt.newIndex;
+      if(oldIndex===newIndex) return;
+      const arr = playlists.find(p=>p.name===currentPlaylist)?.files || [];
+      const [moved] = arr.splice(oldIndex,1);
+      arr.splice(newIndex,0,moved);
+      const pl = playlists.find(p=>p.name===currentPlaylist); if(pl) pl.files = arr; savePlaylists();
+      renderFiles();
+    }
+  });
+}
+
+// file handling
+function fileToBase64(file){
+  return new Promise((res,rej)=>{
+    const reader = new FileReader();
+    reader.onload = ()=>res(reader.result);
+    reader.onerror = rej;
+    reader.readAsDataURL(file);
+  });
+}
+
+document.getElementById('addPlaylist').onclick = ()=> {
+  const name = prompt('プレイリスト名');
+  if(!name) return;
+  playlists.push({name, files: []});
+  savePlaylists();
+  renderPlaylists();
+};
+
+document.getElementById('playlistSearch').oninput = renderPlaylists;
+document.getElementById('fileSearch').oninput = renderFiles;
+
+document.getElementById('fileInput').onchange = async (e) => {
+  const filesList = [...e.target.files];
+  if(!currentPlaylist){ alert('プレイリストを選択してください'); e.target.value=''; return; }
+  const pl = playlists.find(p=>p.name===currentPlaylist);
+  for(const f of filesList){ const data = await fileToBase64(f); pl.files.push({name:f.name, data}); }
+  savePlaylists(); renderFiles();
+  e.target.value = '';
+};
+
+// playback helpers
+function getQueue(){ return playlists.find(p=>p.name===currentPlaylist)?.files || []; }
+
+function playFileIndex(i){
+  const q = getQueue();
+  if(!q || !q[i]) return;
+  const item = q[i];
+  // ensure AudioContext resumed first — this helps iOS allow playback
+  ensureAudioContextConnected().then(()=>{
+    // set src and play
+    player.src = item.data;
+    // small delay can help Safari to prepare
+    setTimeout(()=>{ player.play().catch(()=>{}); }, 50);
+  }).catch(()=>{ player.src = item.data; player.play().catch(()=>{}); });
+  currentIndex = i;
+  startKeepAlive();
+  updateButtons();
+}
+
+// control buttons
+document.getElementById('playBtn').onclick = ()=>{ ensureAudioContextConnected().then(()=>{ player.play().catch(()=>{}); startKeepAlive(); updateButtons(); }); };
+document.getElementById('pauseBtn').onclick = ()=>{ player.pause(); stopKeepAlive(); updateButtons(); };
+document.getElementById('prevBtn').onclick = ()=>{ const q = getQueue(); if(!q || q.length===0) return; currentIndex = (currentIndex - 1 + q.length) % q.length; playFileIndex(currentIndex); };
+document.getElementById('nextBtn').onclick = ()=> nextTrack();
+document.getElementById('loopBtn').onclick = ()=> { loopMode = !loopMode; player.loop = false; document.getElementById('loopBtn').textContent = `🔁 ループ：${loopMode ? 'オン' : 'オフ'}`; };
+document.getElementById('fullscreenBtn').onclick = ()=> { if(player.requestFullscreen) player.requestFullscreen(); else if(player.webkitEnterFullscreen) player.webkitEnterFullscreen(); };
+
+function nextTrack(){
+  const q = getQueue();
+  if(!q || q.length===0) return;
+  // try to resume audio context before switching
+  if(audioCtx && audioCtx.state === 'suspended'){ audioCtx.resume().catch(()=>{}); }
+  if(currentIndex < q.length - 1){ currentIndex++; playFileIndex(currentIndex); }
+  else if(loopMode){ currentIndex = 0; playFileIndex(currentIndex); }
+}
+
+// Avoid aggressive auto-pause by attempting to keep AudioContext alive.
+// We also provide safer handling: on explicit pause stop keep-alive to avoid loop-bug.
+function ensureAudioContextConnected(){
+  return new Promise((resolve, reject) => {
+    try{
+      if(!audioCtx){ audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }
+      if(audioCtx.state === 'suspended'){
+        audioCtx.resume().then(()=>{ 
+          // create media source if needed
+          if(!mediaSource){
+            try{ mediaSource = audioCtx.createMediaElementSource(player); mediaSource.connect(audioCtx.destination); }
+            catch(e){}
+          }
+          resolve();
+        }).catch(()=>{ resolve(); });
+      } else {
+        if(!mediaSource){
+          try{ mediaSource = audioCtx.createMediaElementSource(player); mediaSource.connect(audioCtx.destination); }
+          catch(e){}
+        }
+        resolve();
+      }
+    }catch(e){ console.warn('AudioContext error', e); resolve(); }
+  });
+}
+
+// keep-alive silent buffer — but keep it gentle: use a gain node and very low level
+function startKeepAlive(){
+  try{
+    if(!audioCtx) return;
+    if(keepAliveSource) return; // already running
+    const sampleRate = audioCtx.sampleRate || 44100;
+    const buffer = audioCtx.createBuffer(1, sampleRate, sampleRate);
+    const src = audioCtx.createBufferSource();
+    src.buffer = buffer;
+    src.loop = true;
+    const gain = audioCtx.createGain();
+    gain.gain.value = 0.000001; // near-silent but ensures audio pipeline active
+    src.connect(gain);
+    gain.connect(audioCtx.destination);
+    try{ src.start(0); keepAliveSource = src; keepAliveGain = gain; }catch(e){ console.warn('keepAlive start failed', e); }
+  }catch(e){ console.warn('startKeepAlive error', e); }
+}
+function stopKeepAlive(){
+  try{
+    if(keepAliveSource){
+      try{ keepAliveSource.stop(); }catch(e){}
+      try{ keepAliveSource.disconnect(); }catch(e){}
+      keepAliveSource = null;
+    }
+    if(keepAliveGain){ try{ keepAliveGain.disconnect(); }catch(e){} keepAliveGain = null; }
+  }catch(e){ console.warn('stopKeepAlive', e); }
+}
+
+// handle ended event: attempt to resume audio context then advance
+player.addEventListener('ended', ()=>{ 
+  // protect against spurious tiny-loop behavior by ensuring no keepAlive persists incorrectly
+  stopKeepAlive();
+  // small timeout to allow audio stack to settle
+  setTimeout(()=>{ 
+    // try to resume before next track
+    if(audioCtx && audioCtx.state === 'suspended'){ audioCtx.resume().catch(()=>{}); }
+    nextTrack();
+  }, 50);
+});
+
+// Fix the "pause plays tiny loop" bug: when user pauses, ensure the media element is truly paused and keepAlive stopped.
+// Also guard against Safari firing a short play fragment.
+player.addEventListener('pause', ()=>{
+  // stop the silent buffer to avoid tiny loops
+  stopKeepAlive();
+  updateButtons();
+});
+player.addEventListener('play', ()=>{
+  // ensure we have an active audio context
+  ensureAudioContextConnected().then(()=>{ startKeepAlive(); updateButtons(); });
+});
+player.addEventListener('playing', ()=>{ updateButtons(); });
+player.addEventListener('timeupdate', ()=>{ updateButtons(); });
+
+// visibility handling: since we want playback to continue, we attempt to keep audio context alive.
+// However Safari may still mute output. We'll attempt resume when visibility changes.
+document.addEventListener('visibilitychange', ()=>{
+  // when page gets hidden, we TRY to keep things alive; when it becomes visible, try to re-establish audio.
+  if(document.hidden){
+    // attempt to resume audio context (hopeful) — helps in some Safari versions
+    if(audioCtx && audioCtx.state === 'suspended'){ audioCtx.resume().catch(()=>{}); }
+    // keep keep-alive running; do not auto-pause because user explicitly wanted playback to continue
+    startKeepAlive();
+  } else {
+    // on return, try to resume the element if reasonable
+    if(audioCtx && audioCtx.state === 'suspended'){ audioCtx.resume().catch(()=>{}); }
+    // try to play if the element was playing (some browsers auto-pause); we only attempt if it reports paused=false logically
+    // we won't force playback if the user explicitly paused
+    setTimeout(()=>{ 
+      if(!player.paused){ player.play().catch(()=>{}); startKeepAlive(); }
+    }, 80);
+  }
+});
+
+// UI button state updates
+function updateButtons(){
+  const q = getQueue();
+  const has = q && q.length>0;
+  const prev = document.getElementById('prevBtn');
+  const next = document.getElementById('nextBtn');
+  const play = document.getElementById('playBtn');
+  const pause = document.getElementById('pauseBtn');
+  // enable/disable based on state
+  prev.disabled = !has;
+  next.disabled = !has;
+  play.disabled = !has || !player.src;
+  pause.disabled = !has || player.paused;
+  // visual dim
+  prev.classList.toggle('muted', prev.disabled);
+  next.classList.toggle('muted', next.disabled);
+  play.classList.toggle('muted', play.disabled);
+  pause.classList.toggle('muted', pause.disabled);
+}
+
+// export/import
+document.getElementById('exportBtn').onclick = ()=> {
+  const data = JSON.stringify(playlists);
+  const blob = new Blob([data], {type:'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = 'playlists.json'; a.click(); URL.revokeObjectURL(url);
+};
+
+// theme toggle
+document.getElementById('themeToggle').onclick = ()=>{
+  const html = document.documentElement;
+  html.dataset.theme = html.dataset.theme === 'light' ? 'dark' : 'light';
+  localStorage.setItem('vm-theme', html.dataset.theme);
+};
+
+// initial render
+setTimeout(()=>{ renderPlaylists(); renderFiles(); updateButtons(); }, 200);
+
+</script>
+</body>
+</html>
+"""
+# write file
+path = "/mnt/data/index.html"
+with open(path, "w", encoding="utf-8") as f:
+    f.write(html)
+
+# show a tiny table to provide a clickable download link in the UI
+import pandas as pd
+df = pd.DataFrame([{"file": "index.html", "path": path}])
+display_dataframe_to_user("Generated files (click to download)", df)
+
+html[:200]  # return small output to show exec finished
